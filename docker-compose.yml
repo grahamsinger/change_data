@@ -1,0 +1,170 @@
+name: cdc-demo
+
+services:
+  # --- Source database ---------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: cdc-mysql
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    command:
+      - --default-authentication-plugin=mysql_native_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql/conf.d:/etc/mysql/conf.d:ro
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- Kafka stack -------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: cdc-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: cdc-kafka
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Keep messages around long enough that new downstream consumers can
+      # replay history with --from-beginning. Default is 7 days; bump if you
+      # want to demo "rebuild a service from scratch" weeks later.
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+  # --- Debezium (Kafka Connect with MySQL connector) ---------------------
+  connect:
+    image: debezium/connect:2.5
+    container_name: cdc-connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_started
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: 1
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      STATUS_STORAGE_TOPIC: connect_statuses
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+
+  # --- Full-text search --------------------------------------------------
+  meilisearch:
+    image: getmeili/meilisearch:v1.5
+    container_name: cdc-meili
+    restart: unless-stopped
+    ports:
+      - "7700:7700"
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_ENV: development
+    volumes:
+      - meili-data:/meili_data
+
+  # --- App: API + WebSocket event hub + simulator ------------------------
+  api:
+    build: ./services/api
+    container_name: cdc-api
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: "3306"
+      MYSQL_DB: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      SEARCH_SERVICE_URL: http://search-consumer:8001
+      ANALYTICS_SERVICE_URL: http://analytics-consumer:8002
+
+  # --- App: Search consumer (Kafka -> Meilisearch) -----------------------
+  search-consumer:
+    build: ./services/search_consumer
+    container_name: cdc-search-consumer
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_started
+      meilisearch:
+        condition: service_started
+      api:
+        condition: service_started
+    ports:
+      - "8001:8001"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      MEILI_URL: http://meilisearch:7700
+      MEILI_KEY: ${MEILI_MASTER_KEY}
+      API_EVENT_URL: http://api:8000/events/log
+
+  # --- App: Analytics consumer (Kafka -> in-memory aggregates) -----------
+  analytics-consumer:
+    build: ./services/analytics_consumer
+    container_name: cdc-analytics-consumer
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_started
+      api:
+        condition: service_started
+    ports:
+      - "8002:8002"
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      API_EVENT_URL: http://api:8000/events/log
+
+  # --- App: Frontend (Vite dev server) -----------------------------------
+  frontend:
+    build: ./frontend
+    container_name: cdc-frontend
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+
+volumes:
+  mysql-data:
+  meili-data:
+  kafka-data:
