@@ -33,6 +33,14 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    # ZooKeeper holds the cluster ID that Kafka stores in its own
+    # meta.properties. If ZK's data is ephemeral but kafka-data persists,
+    # a `docker compose down` wipes ZK's ID, ZK regenerates a new one on
+    # restart, and Kafka refuses to start (InconsistentClusterIdException).
+    # Persisting ZK's data keeps the two IDs in agreement across down/up.
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
 
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -168,3 +176,5 @@ volumes:
   mysql-data:
   meili-data:
   kafka-data:
+  zookeeper-data:
+  zookeeper-log:
