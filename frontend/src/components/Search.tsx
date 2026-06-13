@@ -1,12 +1,44 @@
 import { useEffect, useRef, useState } from "react";
-import { jget, SearchResp, SearchStats } from "../api";
+import { Article, jget, SearchResp, SearchStats } from "../api";
 
 export default function Search() {
   const [q, setQ] = useState("");
   const [res, setRes] = useState<SearchResp | null>(null);
   const [busy, setBusy] = useState(false);
   const [stats, setStats] = useState<SearchStats | null>(null);
+  // Which hit is expanded, plus a small cache of full articles fetched on
+  // demand. Search hits carry no body (Meili omits it), so opening one lazily
+  // pulls the full text from MySQL via /articles/{id} and we keep it around so
+  // re-opening is instant.
+  const [openId, setOpenId] = useState<number | null>(null);
+  const [details, setDetails] = useState<Record<number, Article>>({});
+  const [loadingId, setLoadingId] = useState<number | null>(null);
+  const [detailErr, setDetailErr] = useState<number | null>(null);
   const timer = useRef<number | null>(null);
+
+  async function toggleHit(id: number) {
+    if (openId === id) {
+      setOpenId(null);
+      return;
+    }
+    setOpenId(id);
+    if (details[id]) return; // already cached
+    setLoadingId(id);
+    setDetailErr(null);
+    try {
+      const a = await jget<Article>(`/articles/${id}`);
+      setDetails((d) => ({ ...d, [id]: a }));
+    } catch (_) {
+      setDetailErr(id);
+    } finally {
+      setLoadingId(null);
+    }
+  }
+
+  // A fresh query invalidates which result is open.
+  useEffect(() => {
+    setOpenId(null);
+  }, [res]);
 
   useEffect(() => {
     if (timer.current) window.clearTimeout(timer.current);
@@ -57,15 +89,82 @@ export default function Search() {
         {busy ? "Searching…" : res ? `${res.hits.length} hits in ${res.processing_ms ?? "?"}ms` : "Try: 'kettle', 'bread', 'maps'"}
       </div>
       <div className="scroll" style={{ maxHeight: 260 }}>
-        {res?.hits.map((h) => (
-          <div key={h.id} className="article">
-            <div className="title">{h.title}</div>
-            <div className="meta">
-              <span className="tag tag-search">{h.kind}</span>{" "}
-              by <strong>{h.author}</strong> · id #{h.id}
+        {res?.hits.map((h) => {
+          const open = openId === h.id;
+          const detail = details[h.id];
+          return (
+            <div key={h.id} className="article">
+              <div
+                onClick={() => toggleHit(h.id)}
+                style={{ cursor: "pointer" }}
+                title={open ? "Click to collapse" : "Click to read"}
+              >
+                <div className="title">
+                  <span
+                    style={{
+                      display: "inline-block",
+                      width: 12,
+                      color: "var(--muted)",
+                      transition: "transform 150ms",
+                      transform: open ? "rotate(90deg)" : "none",
+                    }}
+                  >
+                    ▸
+                  </span>{" "}
+                  {h.title}
+                </div>
+                <div className="meta">
+                  <span className="tag tag-search">{h.kind}</span>{" "}
+                  by <strong>{h.author}</strong> · id #{h.id}
+                </div>
+              </div>
+              {open && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    paddingTop: 8,
+                    borderTop: "1px solid var(--border)",
+                  }}
+                >
+                  {loadingId === h.id ? (
+                    <div style={{ color: "var(--muted)", fontSize: 12 }}>Loading…</div>
+                  ) : detailErr === h.id ? (
+                    <div style={{ color: "var(--pink)", fontSize: 12 }}>
+                      Could not load article #{h.id}.
+                    </div>
+                  ) : detail ? (
+                    <>
+                      <div
+                        style={{
+                          color: "var(--muted)",
+                          fontSize: 11,
+                          marginBottom: 6,
+                        }}
+                      >
+                        {new Date(detail.published_at).toLocaleString()}
+                      </div>
+                      <div
+                        style={{
+                          whiteSpace: "pre-wrap",
+                          fontSize: 13,
+                          lineHeight: 1.5,
+                          maxHeight: 220,
+                          overflowY: "auto",
+                          fontFamily:
+                            h.kind === "poem"
+                              ? "ui-monospace, SFMono-Regular, monospace"
+                              : "inherit",
+                        }}
+                      >
+                        {detail.body}
+                      </div>
+                    </>
+                  ) : null}
+                </div>
+              )}
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );

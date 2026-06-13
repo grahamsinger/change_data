@@ -175,6 +175,28 @@ def list_articles(limit: int = 25) -> list[dict]:
     return rows
 
 
+@app.get("/articles/{article_id}")
+def get_article(article_id: int) -> dict:
+    """Full article incl. body, by id. Search hits omit the body to stay
+    lean (Meilisearch's displayedAttributes excludes it), so the UI fetches
+    the full text from MySQL — the source of truth — on demand when a result
+    is opened."""
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT a.id, a.title, a.body, a.kind, a.published_at, au.name AS author
+            FROM articles a JOIN authors au ON a.author_id = au.id
+            WHERE a.id = %s
+            """,
+            (article_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise HTTPException(404, f"article {article_id} not found")
+    row["published_at"] = row["published_at"].isoformat()
+    return row
+
+
 # --- Simulator control ----------------------------------------------------
 @app.get("/simulator")
 async def get_sim() -> dict:
