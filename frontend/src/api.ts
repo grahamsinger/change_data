@@ -49,6 +49,9 @@ export type Stats = {
   top_authors: { author: string; count: number }[];
   rate_last_60s: number;
   rate_last_300s: number;
+  // MySQL source-of-truth article count, merged in by the API proxy so the
+  // panel can show rebuild progress (total_articles / mysql_count).
+  mysql_count?: number;
   // Batch metrics from the analytics consumer (post-pipelining):
   events_processed_total?: number;
   state_writes_total?: number;

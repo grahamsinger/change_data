@@ -233,11 +233,29 @@ async def proxy_search(q: str) -> Any:
 
 @app.get("/analytics")
 async def proxy_analytics() -> Any:
+    """Proxy the analytics consumer's /stats, enriched with the MySQL
+    source-of-truth article count. That lets the UI show rebuild progress
+    (total_articles / mysql_count) — the analytics analog of the search
+    panel's indexed-fraction bar. Mirrors how /search/stats is enriched."""
+
+    def _mysql_count() -> int:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM articles")
+            return int(cur.fetchone()["c"])
+
+    mysql_count_task = asyncio.to_thread(_mysql_count)
     async with httpx.AsyncClient(timeout=5) as client:
         r = await client.get(f"{ANALYTICS_URL}/stats")
         if r.status_code >= 400:
             raise HTTPException(r.status_code, r.text)
-        return r.json()
+        stats = r.json()
+    try:
+        stats["mysql_count"] = await mysql_count_task
+    except Exception:
+        # Don't fail the whole panel if the source count is briefly unavailable;
+        # the UI hides the progress bar when mysql_count is missing/0.
+        stats.setdefault("mysql_count", 0)
+    return stats
 
 
 @app.get("/lag-breakdown")

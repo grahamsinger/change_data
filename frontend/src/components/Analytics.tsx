@@ -43,6 +43,8 @@ export default function Analytics() {
         <span className="pill"><strong>{stats.rate_last_300s}</strong> in last 5m</span>
       </div>
 
+      <RebuildProgress stats={stats} />
+
       <BatchingInfo stats={stats} />
 
       {sizes && (
@@ -119,6 +121,67 @@ export default function Analytics() {
             <div style={{ color: "var(--muted)" }}>No data yet — publish or start the simulator.</div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function RebuildProgress({ stats }: { stats: Stats }) {
+  // Aggregated-fraction of the source, the analytics analog of the search
+  // panel's "Indexed: X / Y (Z%)" bar. Shown only while behind MySQL (during a
+  // re-snapshot / catch-up); hidden once the store has caught up to truth.
+  const total = stats.mysql_count ?? 0;
+  const done = stats.total_articles;
+  if (total === 0 || done >= total) return null;
+
+  const pct = Math.min(100, (done / total) * 100);
+  const rate = stats.events_per_sec ?? 0;
+  const remaining = total - done;
+  const etaSec = rate > 0 ? Math.ceil(remaining / rate) : null;
+
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          fontSize: 11,
+          marginBottom: 4,
+          color: "var(--muted)",
+        }}
+      >
+        <span>
+          Rebuilt:{" "}
+          <strong style={{ color: "var(--text)" }}>{done.toLocaleString()}</strong>
+          {" / "}
+          <strong style={{ color: "var(--text)" }}>{total.toLocaleString()}</strong>
+          {" "}
+          ({pct.toFixed(1)}%)
+        </span>
+        {etaSec !== null && (
+          <span>
+            ~{etaSec}s left @{" "}
+            <strong style={{ color: "var(--text)" }}>{Math.round(rate).toLocaleString()}</strong>/sec
+          </span>
+        )}
+      </div>
+      <div
+        style={{
+          height: 10,
+          background: "var(--panel-2)",
+          borderRadius: 4,
+          overflow: "hidden",
+          border: "1px solid var(--border)",
+        }}
+      >
+        <div
+          style={{
+            width: `${pct}%`,
+            height: "100%",
+            background: "var(--purple)",
+            transition: "width 200ms ease",
+          }}
+        />
       </div>
     </div>
   );
