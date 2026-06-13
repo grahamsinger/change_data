@@ -55,10 +55,21 @@ BATCH_EVENT_URL = EVENT_URL + "-batch" if EVENT_URL else ""
 SOURCE_TOPICS = ["cdc.demo.articles", "cdc.demo.authors"]
 CHANGELOG_TOPIC = "cdc.analytics-state"
 
-# How often we force the producer to flush queued state writes. Sets an
-# upper bound on changelog write latency during quiet periods; under load,
-# the size-based flush inside aiokafka kicks in well before this fires.
+# How often we drain the coalescing buffer and force the producer to flush.
+# Sets an upper bound on changelog write latency during quiet periods; under
+# load, the size trigger (COALESCE_MAX_KEYS) fires well before this does.
 STATE_FLUSH_INTERVAL_MS = 100
+
+# Write coalescing. Every value we write to the changelog is the *absolute*
+# current state (a count, a name, an author id — never a delta), so repeated
+# writes to the same key within a flush window are redundant: only the last
+# one matters to a compacted-changelog consumer. We buffer mutations keyed by
+# changelog key and emit one send per *distinct* key per flush, instead of one
+# per logical mutation. This is the analog of the search-consumer's batched
+# add_documents (which also dedupes by primary key): it collapses the
+# 4-writes-per-article firehose — especially the hot `total` key, written on
+# every single insert — down to at most one write per key per window.
+COALESCE_MAX_KEYS = 5000
 
 # Trace event batching. Same pattern as search-consumer: enqueue in memory,
 # flush in batches via /events/log-batch instead of one HTTP POST per event.
@@ -107,6 +118,15 @@ _events_processed_total = 0
 # in <5s and we under-counted.
 _throughput_samples: deque[tuple[float, int, int]] = deque(maxlen=15)
 
+# Coalescing buffer: changelog key -> latest absolute value (None == tombstone).
+# write_state records into this map (no Kafka I/O); the flusher drains it,
+# emitting one send per distinct key. The swap in _flush_dirty is done without
+# an intervening await, so it's atomic against the single-task consume loop —
+# no lock needed. _logical_writes_total counts pre-coalesce mutations so /stats
+# can report the coalescing ratio (logical writes collapsed per actual send).
+_dirty: dict[str, Any] = {}
+_logical_writes_total = 0
+
 
 # ---------------------------------------------------------------------------
 # Changelog write helpers
@@ -143,37 +163,65 @@ def _send_callback(fut: asyncio.Future) -> None:
 
 
 async def write_state(key: str, value: Any) -> None:
-    """Publish one state mutation to the compacted changelog topic.
+    """Record one state mutation into the coalescing buffer (no Kafka I/O).
 
-    Fire-and-forget: returns as soon as the message is enqueued in the
-    producer's internal buffer. The producer batches per-partition under
-    linger_ms and ships them asynchronously. Per-key order is preserved
-    because same key -> same partition, and idempotence guards against
-    retry-induced reorders. Backpressure is automatic — if the buffer
-    fills up, `send` itself awaits until room is available.
+    We do *not* send to Kafka here. Instead we stash key -> latest value in
+    the in-memory dirty map. Because every value is the absolute current
+    state (never a delta), repeated writes to the same key within a flush
+    window are redundant — only the last one matters to a compacted-changelog
+    consumer — so overwriting in a dict is exactly the right semantics. The
+    state_flusher (or the size trigger below) drains the map, emitting one
+    send per distinct key.
 
-    Pass value=None to write a tombstone (key gets removed at compaction).
+    Pass value=None to record a tombstone (key gets removed at compaction);
+    dict stores None as a value, so `key in _dirty` still distinguishes it
+    from an untouched key.
     """
-    if producer is None:
+    global _logical_writes_total
+    _logical_writes_total += 1
+    _dirty[key] = value
+    # Size trigger: bound memory and write latency under heavy load, mirroring
+    # the search-consumer's MAX_BATCH_SIZE. Distinct keys per window stay small
+    # even at high event rates (bounded by authors/articles actually touched).
+    if len(_dirty) >= COALESCE_MAX_KEYS:
+        await _flush_dirty()
+
+
+async def _flush_dirty() -> None:
+    """Drain the coalescing buffer, emitting one changelog send per distinct
+    key. The producer's own linger_ms then batches these sends into broker
+    requests — so we get two layers of reduction: coalesce-by-key here, then
+    batch-on-the-wire in aiokafka.
+
+    The `batch = _dirty; _dirty = {}` swap has no await between its two
+    statements, so it's atomic against the single-task consume loop: any
+    write_state that runs while we're awaiting sends below lands in the fresh
+    map and is picked up by the next flush."""
+    global _dirty
+    if not _dirty or producer is None:
         return
-    payload = None if value is None else json.dumps({"v": value}).encode("utf-8")
-    fut = await producer.send(CHANGELOG_TOPIC, key=key.encode("utf-8"), value=payload)
-    fut.add_done_callback(_send_callback)
+    batch = _dirty
+    _dirty = {}
+    for key, value in batch.items():
+        payload = None if value is None else json.dumps({"v": value}).encode("utf-8")
+        fut = await producer.send(CHANGELOG_TOPIC, key=key.encode("utf-8"), value=payload)
+        fut.add_done_callback(_send_callback)
 
 
 async def state_flusher() -> None:
-    """Bound the worst-case staleness of buffered changelog writes by
-    forcing a flush every STATE_FLUSH_INTERVAL_MS. Under heavy load
-    aiokafka flushes naturally on size; this just covers the quiet path."""
+    """Drain the coalescing buffer and force a producer flush every
+    STATE_FLUSH_INTERVAL_MS. Bounds worst-case changelog staleness during
+    quiet periods; under load the size trigger in write_state fires first."""
     interval = STATE_FLUSH_INTERVAL_MS / 1000
     while True:
         await asyncio.sleep(interval)
         if producer is None:
             continue
         try:
+            await _flush_dirty()
             await producer.flush()
         except Exception as e:  # noqa: BLE001
-            log.exception("periodic producer flush failed: %s", e)
+            log.exception("periodic state flush failed: %s", e)
 
 
 async def throughput_sampler() -> None:
@@ -272,18 +320,34 @@ async def restore_from_changelog() -> int:
         if end_offset == 0:
             log.info("changelog topic empty; starting from empty state")
             return 0
+        # Read the whole changelog up to end_offset. The per-article
+        # `article_author:<id>` key means the surviving (post-compaction)
+        # record count grows linearly with articles — at multi-million scale
+        # an arbitrary iteration cap silently truncates the restore, leaving
+        # high-offset keys (notably `total`, rewritten every event so its only
+        # survivor lives near the end) unapplied and the in-memory totals
+        # wrong. Loop until we actually reach end_offset, with a no-progress
+        # guard so a stalled fetch can't spin forever.
         n = 0
-        for _ in range(500):
-            if (await consumer.position(tp)) >= end_offset:
-                break
-            batches = await consumer.getmany(timeout_ms=500, max_records=1000)
+        empty_polls = 0
+        while (await consumer.position(tp)) < end_offset:
+            batches = await consumer.getmany(timeout_ms=1000, max_records=2000)
             if not batches:
-                break
+                empty_polls += 1
+                if empty_polls >= 3:
+                    log.warning(
+                        "restore stopped early at offset %d/%d (no more records arriving)",
+                        await consumer.position(tp), end_offset,
+                    )
+                    break
+                continue
+            empty_polls = 0
             for _tp, msgs in batches.items():
                 for msg in msgs:
                     apply_state_entry(msg.key, msg.value)
                     n += 1
-        log.info("restored stats from %d changelog entries", n)
+        log.info("restored stats from %d changelog entries (read to offset %d/%d)",
+                 n, await consumer.position(tp), end_offset)
         return n
     finally:
         await consumer.stop()
@@ -409,8 +473,10 @@ async def consume() -> None:
             traces.cancel()
             sampler.cancel()
             # Drain in-flight work on shutdown so we don't lose trace events
-            # or queued state writes.
+            # or queued state writes. Flush the coalescing buffer first, then
+            # the producer's own send buffer.
             try:
+                await _flush_dirty()
                 await producer.flush()
                 await flush_traces()
             except Exception:  # noqa: BLE001
@@ -525,10 +591,19 @@ def _batch_metrics() -> dict:
         dt = max(0.001, last[0] - first[0])
         events_per_sec = (last[1] - first[1]) / dt
         writes_per_sec = (last[2] - first[2]) / dt
+    # Coalescing ratio: logical mutations collapsed per actual changelog send.
+    # 1.0 = no coalescing; 4.0 = we cut changelog writes to a quarter. Climbs
+    # during replay when hot keys (esp. `total`) get hit repeatedly per window.
+    coalesce_ratio = (
+        _logical_writes_total / _state_writes_total
+        if _state_writes_total > 0 else 0.0
+    )
     return {
         "events_processed_total": _events_processed_total,
+        "logical_writes_total": _logical_writes_total,
         "state_writes_total": _state_writes_total,
         "state_write_failures": _state_write_failures,
+        "coalesce_ratio": round(coalesce_ratio, 2),
         "events_per_sec": round(events_per_sec, 1),
         "state_writes_per_sec": round(writes_per_sec, 1),
         "trace_batch_size": TRACE_BATCH_SIZE,
