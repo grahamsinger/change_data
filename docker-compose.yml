@@ -60,9 +60,10 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      # Keep messages around long enough that new downstream consumers can
-      # replay history with --from-beginning. Default is 7 days; bump if you
-      # want to demo "rebuild a service from scratch" weeks later.
+      # Broker default only. The CDC source topics (cdc.demo.*) override this
+      # with retention.ms=-1, set when Debezium creates them (see
+      # topic.creation.default.* in debezium/mysql-connector.json), so their
+      # full history stays replayable no matter how long the stack is down.
       KAFKA_LOG_RETENTION_HOURS: 168
     volumes:
       - kafka-data:/var/lib/kafka/data
@@ -93,7 +94,7 @@ services:
 
   # --- Full-text search --------------------------------------------------
   meilisearch:
-    image: getmeili/meilisearch:v1.5
+    image: getmeili/meilisearch:v1.56.2
     container_name: cdc-meili
     restart: unless-stopped
     ports:

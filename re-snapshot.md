@@ -90,6 +90,23 @@ curl -sS -X DELETE "http://localhost:7700/indexes/articles" -H "Authorization: B
 > `auto_offset_reset="earliest"` on both consumers, they start from 0 on
 > restart regardless.
 
+> **Retention.** The connector config sets `topic.creation.default.retention.ms=-1`,
+> so the source topics Debezium recreates in step 5 keep their full history
+> forever and `replay.sh` keeps working after long downtime. Verify after the
+> snapshot starts (expect `retention.ms=-1`); if it is missing, set it by hand:
+>
+> ```bash
+> docker exec cdc-kafka kafka-configs --bootstrap-server localhost:9092 \
+>   --describe --entity-type topics --entity-name cdc.demo.articles
+> docker exec cdc-kafka kafka-configs --bootstrap-server localhost:9092 --alter \
+>   --entity-type topics --entity-name cdc.demo.articles --add-config retention.ms=-1
+> ```
+>
+> Note the 7-day broker default deletes by record timestamp even while the
+> stack is stopped: on 2026-11-11 the whole June history was purged ~20s after
+> the broker started, which emptied `cdc.demo.authors` and left the
+> search-consumer unable to resolve author names on its next restart.
+
 **5. Resume the connector** → with offsets gone and `snapshot.mode: initial`,
 Debezium performs a full snapshot of `demo.authors` then `demo.articles`,
 emitting one `op=r` ("read") event per row into the freshly recreated topics.
